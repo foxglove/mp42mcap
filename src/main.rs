@@ -1,6 +1,7 @@
 use clap::Parser;
 use ffmpeg_next as ffmpeg;
 use std::path::PathBuf;
+use std::error::Error;
 
 // Include generated protobuf code
 pub mod foxglove {
@@ -28,7 +29,7 @@ struct Cli {
     output: PathBuf,
 }
 
-fn main() -> Result<(), ffmpeg::Error> {
+fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
     println!("Converting {:?} to {:?}", cli.input, cli.output);
@@ -50,6 +51,15 @@ fn main() -> Result<(), ffmpeg::Error> {
     let codec = ffmpeg::codec::context::Context::from_parameters(
         input.streams().best(ffmpeg::media::Type::Video).unwrap().parameters()
     )?;
+
+    // Check if codec is supported and get format string
+    let codec_format = match codec.id() {
+        ffmpeg::codec::Id::H264 => "h264",
+        ffmpeg::codec::Id::H265 => "h265",
+        ffmpeg::codec::Id::HEVC => "h265",
+        other => return Err(format!("Unsupported codec {:?}", other).into()),
+    };
+
     let mut decoder = codec.decoder().video()?;
 
     // Iterate over packets
@@ -76,7 +86,7 @@ fn main() -> Result<(), ffmpeg::Error> {
                     nanos: ((packet.pts().unwrap_or(0) % 1000) * 1_000_000) as i32,
                 }),
                 data: frame.data(0).to_vec(),
-                format: "h264".to_string(),
+                format: codec_format.to_string(),
             };
 
             // Serialize the protobuf message
