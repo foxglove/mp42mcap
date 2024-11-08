@@ -1,6 +1,6 @@
 use clap::Parser;
 use ffmpeg_next as ffmpeg;
-use std::path::PathBuf;
+use std::{io::Write, path::PathBuf};
 use std::error::Error;
 
 // Include generated protobuf code
@@ -11,6 +11,9 @@ pub mod foxglove {
 use foxglove::CompressedVideo;
 use prost::Message;
 use prost_types;
+
+use mcap::{Channel, Writer, records::MessageHeader};
+use std::{collections::BTreeMap, fs::File, io::BufWriter};
 
 /// Convert MP4 files to MCAP format
 #[derive(Parser)]
@@ -62,6 +65,23 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut decoder = codec.decoder().video()?;
 
+    // Open MCAP file for writing
+    let mut writer = Writer::new(
+        BufWriter::new(File::create(&cli.output)?),
+    )?;
+
+    // Create video channel
+    let channel = Channel {
+        topic: String::from("video"),
+        message_encoding: String::from("protobuf"),
+        schema: None,
+        metadata: BTreeMap::default(),
+    };
+    let channel_id = writer.add_channel(&channel)?;
+
+    // Add sequence counter
+    let mut sequence: u32 = 0;
+
     // Iterate over packets
     let mut frame = ffmpeg::frame::Video::empty();
     let mut packet_iter = input.packets();
@@ -71,31 +91,51 @@ fn main() -> Result<(), Box<dyn Error>> {
             continue;
         }
 
+        // Get timestamp
+        let timestamp_ns = (packet.pts().unwrap_or(0) * 1_000_000_000) as u64;
+
         // Send the packet to the decoder
         decoder.send_packet(&packet)?;
 
         // Receive all frames from this packet
         while decoder.receive_frame(&mut frame).is_ok() {
-            println!("Processing frame: {}x{}", frame.width(), frame.height());
+            print!(".");
+            std::io::stdout().flush()?;
 
             // Create a VideoFrame message
             let message = CompressedVideo {
                 frame_id: "video".to_string(),
                 timestamp: Some(prost_types::Timestamp {
-                    seconds: packet.pts().unwrap_or(0) / 1000,
-                    nanos: ((packet.pts().unwrap_or(0) % 1000) * 1_000_000) as i32,
+                    seconds: (timestamp_ns / 1_000_000_000) as i64,
+                    nanos: (timestamp_ns % 1_000_000_000) as i32,
                 }),
                 data: frame.data(0).to_vec(),
                 format: codec_format.to_string(),
             };
 
             // Serialize the protobuf message
-            let _encoded = message.encode_to_vec();
+            let encoded = message.encode_to_vec();
 
-            // TODO: Write the encoded data to your MCAP file
-            // You'll need to implement the MCAP writing logic here
+            // Write the encoded data to MCAP file
+            writer.write_to_known_channel(
+                &MessageHeader {
+                    channel_id,
+                    sequence,
+                    log_time: timestamp_ns,
+                    publish_time: timestamp_ns,
+                },
+                &encoded,
+            )?;
+
+            // Increment sequence (wrap at u32::MAX)
+            sequence = sequence.wrapping_add(1);
         }
     }
+
+    println!();
+
+    // Close the MCAP file
+    writer.finish()?;
 
     // Send EOF to cleanly close the decoder
     decoder.send_eof()?;
