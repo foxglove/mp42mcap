@@ -1,68 +1,62 @@
 use clap::Parser;
 use ffmpeg_next as ffmpeg;
-use std::{io::Write, path::PathBuf};
-use std::error::Error;
 use std::borrow::Cow;
+use std::error::Error;
+use std::{io::Write, path::PathBuf};
 
 // Include generated protobuf code
 pub mod foxglove {
-        include!(concat!(env!("OUT_DIR"), "/foxglove.rs"));
+    include!(concat!(env!("OUT_DIR"), "/foxglove.rs"));
 }
 
 use foxglove::CompressedVideo;
 use prost::Message;
 use prost_types;
 
-use mcap::{Channel, Schema, Writer, records::MessageHeader};
+use mcap::{records::MessageHeader, Channel, Schema, Writer};
 use std::{collections::BTreeMap, fs::File, io::BufWriter};
 
 /// Converts a video packet from AVCC/HVCC format (length-prefixed) to Annex B format (start code-prefixed)
 fn convert_to_annex_b(data: &[u8], codec_format: &str) -> Vec<u8> {
     let mut converted = Vec::new();
     let mut pos = 0;
-    let mut nal_count = 0;
 
-    println!("\nPacket size: {} bytes", data.len());
     while pos < data.len() {
         if pos + 4 > data.len() {
             break;
         }
-        let nal_size = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        let nal_size =
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
 
         // Get NAL type
         let nal_type = if pos + 4 + 1 <= data.len() {
             match codec_format {
-                "h264" => data[pos + 4] & 0x1F,  // Last 5 bits for H.264
-                "h265" => (data[pos + 4] >> 1) & 0x3F,  // Bits 1-6 for H.265
+                "h264" => data[pos + 4] & 0x1F,        // Last 5 bits for H.264
+                "h265" => (data[pos + 4] >> 1) & 0x3F, // Bits 1-6 for H.265
                 _ => 0,
             }
         } else {
             0
         };
 
-        println!("  NAL #{}: size={}, type={:#x}", nal_count, nal_size, nal_type);
-
         pos += 4;
 
         // Skip SPS, PPS, and SEI NALs since we're manually handling them
-        if nal_type != 0x7 && nal_type != 0x8 && nal_type != 0x6 {  // 7 = SPS, 8 = PPS, 6 = SEI
+        // 7 = SPS, 8 = PPS, 6 = SEI
+        if nal_type != 0x7 && nal_type != 0x8 && nal_type != 0x6 {
             converted.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
             if pos + nal_size <= data.len() {
                 converted.extend_from_slice(&data[pos..pos + nal_size]);
             }
-        } else {
-            println!("  Skipping SPS/PPS/SEI NAL");
         }
 
         if pos + nal_size <= data.len() {
             pos += nal_size;
-            nal_count += 1;
         } else {
-            println!("  Warning: Incomplete NAL unit at end of packet");
             break;
         }
     }
-    println!("  Total NALs in packet: {}", nal_count);
+
     converted
 }
 
@@ -103,7 +97,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Get the decoder from the stream parameters
     let codec = ffmpeg::codec::context::Context::from_parameters(
-        input.streams().best(ffmpeg::media::Type::Video).unwrap().parameters()
+        input
+            .streams()
+            .best(ffmpeg::media::Type::Video)
+            .unwrap()
+            .parameters(),
     )?;
 
     // Check if codec is supported and get format string
@@ -116,7 +114,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
 
     // Get the video stream parameters
-    let params = input.streams()
+    let params = input
+        .streams()
         .best(ffmpeg::media::Type::Video)
         .unwrap()
         .parameters();
@@ -129,18 +128,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         std::slice::from_raw_parts((*ptr).extradata, (*ptr).extradata_size as usize)
     };
-
-    println!("Extradata size: {} bytes", extradata.len());
-
-    // Debug print raw extradata
-    println!("Raw extradata:");
-    for chunk in extradata.chunks(16) {
-        print!("  ");
-        for byte in chunk {
-            print!("{:02x} ", byte);
-        }
-        println!();
-    }
 
     // Create the decoder after getting all the info we need
     let mut decoder = codec.decoder().video()?;
@@ -155,57 +142,35 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Get SPS
     let num_sps = extradata[offset] & 0x1F;
     offset += 1;
-    println!("Number of SPS NALs: {}", num_sps);
     for _ in 0..num_sps {
         let sps_size = ((extradata[offset] as usize) << 8) | (extradata[offset + 1] as usize);
         offset += 2;
         sps_nals.extend_from_slice(&[0, 0, 0, 1]); // Add NAL start code
         sps_nals.extend_from_slice(&extradata[offset..offset + sps_size]);
-        println!("Found SPS NAL, size: {}", sps_size);
         offset += sps_size;
     }
 
     // Get PPS
     let num_pps = extradata[offset];
     offset += 1;
-    println!("Number of PPS NALs: {}", num_pps);
     for _ in 0..num_pps {
         let pps_size = ((extradata[offset] as usize) << 8) | (extradata[offset + 1] as usize);
         offset += 2;
         pps_nals.extend_from_slice(&[0, 0, 0, 1]); // Add NAL start code
         pps_nals.extend_from_slice(&extradata[offset..offset + pps_size]);
-        println!("Found PPS NAL, size: {}", pps_size);
         offset += pps_size;
     }
 
-    // Debug print the NALs
-    println!("SPS NAL ({} bytes):", sps_nals.len());
-    for chunk in sps_nals.chunks(16) {
-        print!("  ");
-        for byte in chunk {
-            print!("{:02x} ", byte);
-        }
-        println!();
-    }
-    println!("PPS NAL ({} bytes):", pps_nals.len());
-    for chunk in pps_nals.chunks(16) {
-        print!("  ");
-        for byte in chunk {
-            print!("{:02x} ", byte);
-        }
-        println!();
-    }
-
     // Open MCAP file for writing
-    let mut writer = Writer::new(
-        BufWriter::new(File::create(&cli.output)?),
-    )?;
+    let mut writer = Writer::new(BufWriter::new(File::create(&cli.output)?))?;
 
     // Create video channel with schema
     let schema = Schema {
         name: String::from("foxglove.CompressedVideo"),
         encoding: String::from("protobuf"),
-        data: Cow::Owned(include_bytes!(concat!(env!("OUT_DIR"), "/foxglove_descriptor.bin")).to_vec()),
+        data: Cow::Owned(
+            include_bytes!(concat!(env!("OUT_DIR"), "/foxglove_descriptor.bin")).to_vec(),
+        ),
     };
     let channel = Channel {
         topic: String::from("video"),
@@ -228,6 +193,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut frame_packets: Vec<Vec<u8>> = Vec::new();
     let mut first_frame = true;
 
+    let mut last_timestamp = u64::MAX; // Initialize to max value so first frame always passes
+    let mut last_progress = 0u64; // Track last progress update in nanoseconds
+
     while let Some((stream, packet)) = packet_iter.next() {
         // Skip packets that aren't from our video stream
         if stream.index() != video_stream_index {
@@ -237,15 +205,29 @@ fn main() -> Result<(), Box<dyn Error>> {
         // Get timestamp
         let pts = packet.pts().unwrap_or(0);
         let dts = packet.dts().unwrap_or(0);
-        let timestamp_ns = (pts as f64 * time_base.numerator() as f64 / time_base.denominator() as f64 * 1_000_000_000.0) as u64;
-
-        println!("\nPacket: pts={}, dts={}, is_key={}", pts, dts, packet.is_key());
+        let timestamp_ns = (pts as f64 * time_base.numerator() as f64
+            / time_base.denominator() as f64
+            * 1_000_000_000.0) as u64;
 
         // Convert AVCC/HVCC to Annex B
         if let Some(data) = packet.data() {
             if !data.is_empty() {
+                let pts = packet.pts().ok_or("Missing PTS")?;
+                let dts = packet.dts().ok_or("Missing DTS")?;
+
+                if pts != dts {
+                    return Err(format!(
+                        "This video contains B-frames or reordered frames (PTS={}, DTS={}). \
+                        Please re-encode the video without B-frames using: \
+                        ffmpeg -i {} -c:v libx264 -bf 0 output.mp4",
+                        pts,
+                        dts,
+                        cli.input.display()
+                    )
+                    .into());
+                }
+
                 if first_frame {
-                    println!("Processing first frame - prepending codec SPS/PPS");
                     first_frame = false;
                     let mut frame_data = Vec::new();
                     // Add SPS and PPS first
@@ -256,7 +238,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                     frame_data.extend_from_slice(&converted);
                     frame_packets.push(frame_data);
                 } else if packet.is_key() {
-                    println!("Processing keyframe - prepending codec SPS/PPS");
                     let mut frame_data = Vec::new();
                     // Add SPS and PPS first
                     frame_data.extend_from_slice(&sps_nals);
@@ -278,9 +259,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         // Receive frame if ready
         match decoder.receive_frame(&mut frame) {
             Ok(_) => {
-                println!("Frame decoded! Accumulated {} packets", frame_packets.len());
-                print!("{}", frame_packets.len());
-                std::io::stdout().flush()?;
+                // Print . for every 1s of video
+                if timestamp_ns >= last_progress + 1_000_000_000 {
+                    print!(".");
+                    std::io::stdout().flush()?;
+                    last_progress = timestamp_ns;
+                }
 
                 // Create a single buffer for the entire frame
                 let mut frame_data = Vec::new();
@@ -288,27 +272,23 @@ fn main() -> Result<(), Box<dyn Error>> {
                     frame_data.extend_from_slice(packet_data);
                 }
 
-                // Debug print NAL types
-                let mut offset = 0;
-                while offset < frame_data.len() {
-                    // Find next NAL start code
-                    if frame_data[offset..].starts_with(&[0, 0, 0, 1]) {
-                        let nal_type = frame_data[offset + 4] & 0x1F;
-                        println!("NAL type: 0x{:x}", nal_type);
-                        offset += 4;
-                    } else {
-                        offset += 1;
-                    }
+                // Check for monotonic timestamps before writing
+                if timestamp_ns <= last_timestamp && last_timestamp != u64::MAX {
+                    return Err(format!(
+                        "Non-monotonic or duplicate timestamp detected! Current: {}ns, Last: {}ns, PTS: {}, DTS: {}",
+                        timestamp_ns, last_timestamp, pts, dts
+                    ).into());
                 }
+                last_timestamp = timestamp_ns;
 
-                // Create a VideoFrame message
+                // Create and write the message
                 let message = CompressedVideo {
                     frame_id: "video".to_string(),
                     timestamp: Some(prost_types::Timestamp {
                         seconds: (timestamp_ns / 1_000_000_000) as i64,
                         nanos: (timestamp_ns % 1_000_000_000) as i32,
                     }),
-                    data: frame_data,  // Use concatenated frame data
+                    data: frame_data,
                     format: codec_format.to_string(),
                 };
 
@@ -332,11 +312,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 if sequence >= 100 {
                     break;
                 }
-            },
-            Err(ffmpeg::Error::Other { errno: ffmpeg::error::EAGAIN }) => {
-                println!("Need more packets for frame");
+            }
+            Err(ffmpeg::Error::Other {
+                errno: ffmpeg::error::EAGAIN,
+            }) => {
                 continue;
-            },
+            }
             Err(e) => return Err(e.into()),
         }
     }
