@@ -5,11 +5,29 @@ use ffmpeg_next as ffmpeg;
 use ffmpeg_next::packet::Mut;
 
 #[allow(non_camel_case_types)]
-type AVBSFContext = *mut libc::c_void;
-#[allow(non_camel_case_types)]
 type AVBitStreamFilter = *mut libc::c_void;
 #[allow(non_camel_case_types)]
 type AVPacket = *mut libc::c_void;
+#[allow(non_camel_case_types)]
+type AVCodecParameters = *mut libc::c_void;
+
+#[repr(C)]
+struct AVBSFContext {
+    av_class: *const libc::c_void,
+    filter: *const AVBitStreamFilter,
+    internal: *mut libc::c_void,
+    priv_data: *mut libc::c_void,
+    par_in: *mut AVCodecParameters,
+    par_out: *mut AVCodecParameters,
+    // ... other fields we don't need
+}
+
+#[repr(C)]
+struct FFmpegCodecParameters {
+    codec_type: libc::c_int,
+    codec_id: libc::c_int,
+    // ... other fields we don't need
+}
 
 extern "C" {
     fn av_bsf_get_by_name(name: *const libc::c_char) -> *const AVBitStreamFilter;
@@ -25,7 +43,7 @@ struct BSFContext {
 }
 
 impl BSFContext {
-    fn new(filter_name: &CStr) -> Result<Self, Box<dyn Error>> {
+    fn new(filter_name: &CStr, codec_params: &ffmpeg::codec::Parameters) -> Result<Self, Box<dyn Error>> {
         unsafe {
             let bsf = av_bsf_get_by_name(filter_name.as_ptr());
             if bsf.is_null() {
@@ -37,6 +55,20 @@ impl BSFContext {
             if ret < 0 {
                 return Err(format!("Failed to allocate BSF context: {}", ret).into());
             }
+
+            // Access par_in directly from the context
+            let par_in = (*ctx).par_in;
+
+            // First copy all parameters
+            ptr::copy_nonoverlapping(
+                codec_params.as_ptr() as *const _,
+                par_in,
+                1
+            );
+
+            // Then explicitly set the codec ID
+            let raw_params = par_in as *mut FFmpegCodecParameters;
+            (*raw_params).codec_id = 27; // AV_CODEC_ID_H264 is 27 in FFmpeg
 
             let ret = av_bsf_init(ctx);
             if ret < 0 {
@@ -80,14 +112,17 @@ impl Drop for BSFContext {
     }
 }
 
-pub fn apply_bsf(codec: ffmpeg::codec::Id, packet: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+pub fn apply_bsf(codec: ffmpeg::codec::Id, codec_params: &ffmpeg::codec::Parameters, packet: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
     let filter_name = match codec {
         ffmpeg::codec::Id::H264 => "h264_mp4toannexb\0",
         ffmpeg::codec::Id::H265 | ffmpeg::codec::Id::HEVC => "hevc_mp4toannexb\0",
         other => return Err(format!("Unsupported codec {:?}", other).into()),
     };
 
-    let mut bsf = BSFContext::new(CStr::from_bytes_with_nul(filter_name.as_bytes())?)?;
+    let mut bsf = BSFContext::new(
+        CStr::from_bytes_with_nul(filter_name.as_bytes())?,
+        codec_params
+    )?;
     let mut output = Vec::new();
 
     // Create input packet and copy data

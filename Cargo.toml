@@ -14,3 +14,4 @@ libc = "0.2"
 
 [build-dependencies]
 prost-build = "0.12"
+pkg-config = "0.3"

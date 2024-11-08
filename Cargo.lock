@@ -509,6 +509,7 @@ dependencies = [
  "ffmpeg-next",
  "libc",
  "mcap",
+ "pkg-config",
  "prost",
  "prost-build",
  "prost-types",

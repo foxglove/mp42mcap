@@ -113,7 +113,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         // Convert packet to Annex B format
         if let Some(data) = packet.data() {
             if !data.is_empty() {
-                let converted = bsf::apply_bsf(codec_id, data)?;
+                let converted = bsf::apply_bsf(
+                    codec_id,
+                    &stream.parameters(),
+                    data
+                )?;
                 frame_packets.push(converted);
             }
         }
