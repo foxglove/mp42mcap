@@ -5,6 +5,7 @@ use std::{
     fs::File,
     io::{BufWriter, Write},
     path::PathBuf,
+    time::Instant,
 };
 
 use clap::Parser;
@@ -48,6 +49,7 @@ struct Cli {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
+    let start_time = Instant::now();
     println!("Converting {:?} to {:?}", cli.input, cli.output);
 
     ffmpeg::init()?;
@@ -114,10 +116,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             Err(e) => return Err(e.into()),
         }
     }
-
-    println!();
     writer.finish()?;
     converter.send_eof()?;
+
+    println!(
+        "\nCompleted in {:.3} seconds",
+        start_time.elapsed().as_secs_f64()
+    );
+
     Ok(())
 }
 
