@@ -5,4 +5,11 @@ edition = "2021"
 
 [dependencies]
 ffmpeg-next = "7.1.0"
+mcap = "0.11.0"
 clap = { version = "4.5.20", features = ["derive"] }
+prost = "0.12"
+bytes = "1.5"
+prost-types = "0.12"
+
+[build-dependencies]
+prost-build = "0.12"

@@ -2,6 +2,15 @@ use clap::Parser;
 use ffmpeg_next as ffmpeg;
 use std::path::PathBuf;
 
+// Include generated protobuf code
+pub mod foxglove {
+        include!(concat!(env!("OUT_DIR"), "/foxglove.rs"));
+}
+
+use foxglove::CompressedVideo;
+use prost::Message;
+use prost_types;
+
 /// Convert MP4 files to MCAP format
 #[derive(Parser)]
 #[command(name = env!("CARGO_PKG_NAME"))]
@@ -58,15 +67,28 @@ fn main() -> Result<(), ffmpeg::Error> {
         // Receive all frames from this packet
         while decoder.receive_frame(&mut frame).is_ok() {
             println!("Processing frame: {}x{}", frame.width(), frame.height());
+
+            // Create a VideoFrame message
+            let message = CompressedVideo {
+                frame_id: "video".to_string(),
+                timestamp: Some(prost_types::Timestamp {
+                    seconds: packet.pts().unwrap_or(0) / 1000,
+                    nanos: ((packet.pts().unwrap_or(0) % 1000) * 1_000_000) as i32,
+                }),
+                data: frame.data(0).to_vec(),
+                format: "h264".to_string(),
+            };
+
+            // Serialize the protobuf message
+            let _encoded = message.encode_to_vec();
+
+            // TODO: Write the encoded data to your MCAP file
+            // You'll need to implement the MCAP writing logic here
         }
     }
 
-    // Flush the decoder
+    // Send EOF to cleanly close the decoder
     decoder.send_eof()?;
-    while decoder.receive_frame(&mut frame).is_ok() {
-        println!("Processing frame: {}x{}", frame.width(), frame.height());
-        // Process frame here
-    }
 
     Ok(())
 }
