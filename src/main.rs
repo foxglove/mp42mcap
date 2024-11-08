@@ -72,16 +72,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
 
     // Create video channel with schema
-    let mcap_schema = Schema {
+    let schema = Schema {
         name: String::from("foxglove.CompressedVideo"),
         encoding: String::from("protobuf"),
         data: Cow::Owned(include_bytes!(concat!(env!("OUT_DIR"), "/foxglove_descriptor.bin")).to_vec()),
     };
-
     let channel = Channel {
         topic: String::from("video"),
         message_encoding: String::from("protobuf"),
-        schema: Some(mcap_schema.into()),
+        schema: Some(schema.into()),
         metadata: BTreeMap::default(),
     };
     let channel_id = writer.add_channel(&channel)?;
@@ -89,58 +88,74 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Add sequence counter
     let mut sequence: u32 = 0;
 
-    // Iterate over packets
+    // Get the video stream for time base information
+    let video_stream = input.streams().best(ffmpeg::media::Type::Video).unwrap();
+    let time_base = video_stream.time_base();
+
+    // Create the packet iterator
     let mut frame = ffmpeg::frame::Video::empty();
     let mut packet_iter = input.packets();
-    'outer: while let Some((stream, packet)) = packet_iter.next() {
+    let mut frame_packets: Vec<Vec<u8>> = Vec::new();
+
+    while let Some((stream, packet)) = packet_iter.next() {
         // Skip packets that aren't from our video stream
         if stream.index() != video_stream_index {
             continue;
         }
 
         // Get timestamp
-        let timestamp_ns = (packet.pts().unwrap_or(0) * 1_000_000_000) as u64;
+        let pts = packet.pts().unwrap_or(0);
+        let timestamp_ns = (pts as f64 * time_base.numerator() as f64 / time_base.denominator() as f64 * 1_000_000_000.0) as u64;
 
         // Send the packet to the decoder
         decoder.send_packet(&packet)?;
 
-        // Receive all frames from this packet
-        while decoder.receive_frame(&mut frame).is_ok() {
-            print!(".");
-            std::io::stdout().flush()?;
+        // Store this packet's data
+        frame_packets.push(packet.data().expect("Missing packet data").to_vec());
 
-            // Create a VideoFrame message
-            let message = CompressedVideo {
-                frame_id: "video".to_string(),
-                timestamp: Some(prost_types::Timestamp {
-                    seconds: (timestamp_ns / 1_000_000_000) as i64,
-                    nanos: (timestamp_ns % 1_000_000_000) as i32,
-                }),
-                data: frame.data(0).to_vec(),
-                format: codec_format.to_string(),
-            };
+        // Receive frame if ready
+        match decoder.receive_frame(&mut frame) {
+            Ok(_) => {
+                print!("{}", frame_packets.len());
+                std::io::stdout().flush()?;
 
-            // Serialize the protobuf message
-            let encoded = message.encode_to_vec();
+                // Create a VideoFrame message with all collected packets
+                let message = CompressedVideo {
+                    frame_id: "video".to_string(),
+                    timestamp: Some(prost_types::Timestamp {
+                        seconds: (timestamp_ns / 1_000_000_000) as i64,
+                        nanos: (timestamp_ns % 1_000_000_000) as i32,
+                    }),
+                    data: frame_packets.concat(), // Concatenate all packets for this frame
+                    format: codec_format.to_string(),
+                };
 
-            // Write the encoded data to MCAP file
-            writer.write_to_known_channel(
-                &MessageHeader {
-                    channel_id: channel_id,
-                    sequence,
-                    log_time: timestamp_ns,
-                    publish_time: timestamp_ns,
-                },
-                &encoded,
-            )?;
+                // Clear packets buffer for next frame
+                frame_packets.clear();
 
-            // Increment sequence (wrap at u32::MAX)
-            sequence = sequence.wrapping_add(1);
+                // Serialize and write the protobuf message
+                let encoded = message.encode_to_vec();
+                writer.write_to_known_channel(
+                    &MessageHeader {
+                        channel_id,
+                        sequence,
+                        log_time: timestamp_ns,
+                        publish_time: timestamp_ns,
+                    },
+                    &encoded,
+                )?;
 
-            // Stop after 10 frames while debugging
-            if sequence >= 10 {
-                break 'outer;
-            }
+                // Increment sequence (wrap at u32::MAX)
+                sequence = sequence.wrapping_add(1);
+                if sequence >= 250 {
+                    break;
+                }
+            },
+            Err(ffmpeg::Error::Other { errno: ffmpeg::error::EAGAIN }) => {
+                // Frame not ready yet, continue collecting packets
+                continue;
+            },
+            Err(e) => return Err(e.into()),
         }
     }
 
