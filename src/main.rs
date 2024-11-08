@@ -1,67 +1,25 @@
+use std::{
+    borrow::Cow,
+    collections::BTreeMap,
+    error::Error,
+    fs::File,
+    io::{BufWriter, Write},
+    path::PathBuf,
+};
+
 use clap::Parser;
 use ffmpeg_next as ffmpeg;
-use std::borrow::Cow;
-use std::error::Error;
-use std::{io::Write, path::PathBuf};
-
-// Include generated protobuf code
-pub mod foxglove {
-    include!(concat!(env!("OUT_DIR"), "/foxglove.rs"));
-}
-
-use foxglove::CompressedVideo;
+use mcap::{records::MessageHeader, Channel, Schema, Writer};
 use prost::Message;
 use prost_types;
 
-use mcap::{records::MessageHeader, Channel, Schema, Writer};
-use std::{collections::BTreeMap, fs::File, io::BufWriter};
-
-/// Converts a video packet from AVCC/HVCC format (length-prefixed) to Annex B format (start code-prefixed)
-fn convert_to_annex_b(data: &[u8], codec_format: &str) -> Vec<u8> {
-    let mut converted = Vec::new();
-    let mut pos = 0;
-
-    while pos < data.len() {
-        if pos + 4 > data.len() {
-            break;
-        }
-        let nal_size =
-            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-
-        // Get NAL type
-        let nal_type = if pos + 4 + 1 <= data.len() {
-            match codec_format {
-                "h264" => data[pos + 4] & 0x1F,        // Last 5 bits for H.264
-                "h265" => (data[pos + 4] >> 1) & 0x3F, // Bits 1-6 for H.265
-                _ => 0,
-            }
-        } else {
-            0
-        };
-
-        pos += 4;
-
-        // Skip SPS, PPS, VPS, and SEI NALs
-        if match codec_format {
-            "h264" => nal_type != 0x7 && nal_type != 0x8 && nal_type != 0x6,
-            "h265" => nal_type != 32 && nal_type != 33 && nal_type != 34 && nal_type != 39,
-            _ => true,
-        } {
-            converted.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-            if pos + nal_size <= data.len() {
-                converted.extend_from_slice(&data[pos..pos + nal_size]);
-            }
-        }
-
-        if pos + nal_size <= data.len() {
-            pos += nal_size;
-        } else {
-            break;
-        }
-    }
-
-    converted
+pub mod foxglove {
+    include!(concat!(env!("OUT_DIR"), "/foxglove.rs"));
 }
+use foxglove::CompressedVideo;
+
+mod codec;
+use codec::VideoConverter;
 
 /// Convert MP4 files to MCAP format
 #[derive(Parser)]
@@ -82,169 +40,91 @@ struct Cli {
     /// Topic name for the video messages
     #[arg(long, default_value = "video")]
     topic: String,
+
+    /// Frame ID for the video messages
+    #[arg(long, default_value = "video")]
+    frame_id: String,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
-
     println!("Converting {:?} to {:?}", cli.input, cli.output);
 
-    // Initialize FFmpeg
     ffmpeg::init()?;
 
-    // Open the input file
-    let mut input = ffmpeg::format::input(&cli.input)?;
-
-    // Find the best video stream and store its index
+    let (mut converter, mut input) = VideoConverter::new(&cli.input)?;
     let video_stream_index = input
         .streams()
         .best(ffmpeg::media::Type::Video)
         .ok_or(ffmpeg::Error::StreamNotFound)?
         .index();
 
-    // Get the decoder from the stream parameters
-    let codec = ffmpeg::codec::context::Context::from_parameters(
-        input
-            .streams()
-            .best(ffmpeg::media::Type::Video)
-            .unwrap()
-            .parameters(),
-    )?;
+    let mut writer = Writer::new(BufWriter::new(File::create(&cli.output)?))?;
+    let channel_id = setup_mcap_channel(&mut writer, &cli.topic)?;
 
-    // Check if codec is supported and get format string
-    let codec_id = codec.id();
-    let codec_format = match codec_id {
-        ffmpeg::codec::Id::H264 => "h264",
-        ffmpeg::codec::Id::H265 => "h265",
-        ffmpeg::codec::Id::HEVC => "h265",
-        other => return Err(format!("Unsupported codec {:?}", other).into()),
-    };
+    let mut sequence: u32 = 0;
+    let mut frame = ffmpeg::frame::Video::empty();
+    let first_frame = true;
 
-    // Get the video stream parameters
-    let params = input
-        .streams()
-        .best(ffmpeg::media::Type::Video)
-        .unwrap()
-        .parameters();
-
-    // Extract SPS/PPS from codec parameters
-    let extradata = unsafe {
-        let ptr = params.as_ptr();
-        if (*ptr).extradata.is_null() {
-            panic!("No codec extradata found");
+    let mut packet_iter = input.packets();
+    while let Some((stream, packet)) = packet_iter.next() {
+        if stream.index() != video_stream_index {
+            continue;
         }
-        std::slice::from_raw_parts((*ptr).extradata, (*ptr).extradata_size as usize)
-    };
 
-    // Create the decoder after getting all the info we need
-    let mut decoder = codec.decoder().video()?;
+        let timestamp_ns = converter.get_timestamp(packet.pts().unwrap_or(0));
+        converter.process_packet(&packet, first_frame)?;
+        converter.send_packet(&packet)?;
 
-    // Parse AVCC/HVCC format extradata to get SPS/PPS
-    let mut vps_nals = Vec::new(); // New: VPS NALs for HEVC
-    let mut sps_nals = Vec::new();
-    let mut pps_nals = Vec::new();
-
-    match codec_format {
-        "h264" => {
-            // Existing AVCC parsing
-            let mut offset = 5; // Skip AVCC header
-
-            // Get SPS
-            let num_sps = extradata[offset] & 0x1F;
-            offset += 1;
-            for _ in 0..num_sps {
-                let sps_size =
-                    ((extradata[offset] as usize) << 8) | (extradata[offset + 1] as usize);
-                offset += 2;
-                sps_nals.extend_from_slice(&[0, 0, 0, 1]); // Add NAL start code
-                sps_nals.extend_from_slice(&extradata[offset..offset + sps_size]);
-                offset += sps_size;
-            }
-
-            // Get PPS
-            let num_pps = extradata[offset];
-            offset += 1;
-            for _ in 0..num_pps {
-                let pps_size =
-                    ((extradata[offset] as usize) << 8) | (extradata[offset + 1] as usize);
-                offset += 2;
-                pps_nals.extend_from_slice(&[0, 0, 0, 1]); // Add NAL start code
-                pps_nals.extend_from_slice(&extradata[offset..offset + pps_size]);
-                offset += pps_size;
-            }
-        }
-        "h265" => {
-            // HVCC parsing
-            if extradata.len() < 23 {
-                return Err("HVCC header too short".into());
-            }
-
-            // Skip HVCC header (22 bytes) to reach NAL arrays
-            let mut offset = 22;
-
-            // Get number of array entries
-            let num_arrays = extradata[offset];
-            offset += 1;
-
-            // Process each NAL array
-            for _ in 0..num_arrays {
-                if offset + 3 > extradata.len() {
-                    break;
+        match converter.receive_frame(&mut frame) {
+            Ok(_) => {
+                if converter.update_progress(timestamp_ns) {
+                    print!(".");
+                    std::io::stdout().flush()?;
                 }
 
-                // First byte: NAL type (lower 6 bits)
-                let nal_type = extradata[offset] & 0x3F;
-                let num_nals =
-                    ((extradata[offset + 1] as usize) << 8) | (extradata[offset + 2] as usize);
-                offset += 3;
+                converter.check_timestamp(timestamp_ns)?;
 
-                // Process NALs in this array
-                for _ in 0..num_nals {
-                    if offset + 2 > extradata.len() {
-                        break;
-                    }
+                let message = CompressedVideo {
+                    frame_id: cli.frame_id.clone(),
+                    timestamp: Some(prost_types::Timestamp {
+                        seconds: (timestamp_ns / 1_000_000_000) as i64,
+                        nanos: (timestamp_ns % 1_000_000_000) as i32,
+                    }),
+                    data: converter.take_frame_data(),
+                    format: converter.format_str().to_string(),
+                };
 
-                    let nal_size =
-                        ((extradata[offset] as usize) << 8) | (extradata[offset + 1] as usize);
-                    offset += 2;
+                let encoded = message.encode_to_vec();
+                writer.write_to_known_channel(
+                    &MessageHeader {
+                        channel_id: channel_id.try_into().unwrap(),
+                        sequence,
+                        log_time: timestamp_ns,
+                        publish_time: timestamp_ns,
+                    },
+                    &encoded,
+                )?;
 
-                    if offset + nal_size > extradata.len() {
-                        break;
-                    }
-
-                    // Add NAL start code and data to appropriate vector
-                    let nal_data = &[0, 0, 0, 1];
-                    match nal_type {
-                        32 => {
-                            vps_nals.extend_from_slice(nal_data);
-                            vps_nals.extend_from_slice(&extradata[offset..offset + nal_size]);
-                        }
-                        33 => {
-                            sps_nals.extend_from_slice(nal_data);
-                            sps_nals.extend_from_slice(&extradata[offset..offset + nal_size]);
-                        }
-                        34 => {
-                            pps_nals.extend_from_slice(nal_data);
-                            pps_nals.extend_from_slice(&extradata[offset..offset + nal_size]);
-                        }
-                        _ => {}
-                    }
-                    offset += nal_size;
-                }
+                sequence = sequence.wrapping_add(1);
             }
-
-            // Verify we got the necessary NALs
-            if sps_nals.is_empty() || pps_nals.is_empty() {
-                return Err("Missing required HEVC parameter sets".into());
-            }
+            Err(ffmpeg::Error::Other {
+                errno: ffmpeg::error::EAGAIN,
+            }) => continue,
+            Err(e) => return Err(e.into()),
         }
-        _ => return Err("Unsupported codec format".into()),
     }
 
-    // Open MCAP file for writing
-    let mut writer = Writer::new(BufWriter::new(File::create(&cli.output)?))?;
+    println!();
+    writer.finish()?;
+    converter.send_eof()?;
+    Ok(())
+}
 
-    // Create video channel with schema
+fn setup_mcap_channel(
+    writer: &mut Writer<BufWriter<File>>,
+    topic: &str,
+) -> Result<u64, Box<dyn Error>> {
     let schema = Schema {
         name: String::from("foxglove.CompressedVideo"),
         encoding: String::from("protobuf"),
@@ -253,160 +133,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         ),
     };
     let channel = Channel {
-        topic: cli.topic,
+        topic: topic.to_string(),
         message_encoding: String::from("protobuf"),
         schema: Some(schema.into()),
         metadata: BTreeMap::default(),
     };
-    let channel_id = writer.add_channel(&channel)?;
-
-    // Add sequence counter
-    let mut sequence: u32 = 0;
-
-    // Get the video stream for time base information
-    let video_stream = input.streams().best(ffmpeg::media::Type::Video).unwrap();
-    let time_base = video_stream.time_base();
-
-    // Create the packet iterator
-    let mut frame = ffmpeg::frame::Video::empty();
-    let mut packet_iter = input.packets();
-    let mut frame_packets: Vec<Vec<u8>> = Vec::new();
-    let mut first_frame = true;
-
-    let mut last_timestamp = u64::MAX; // Initialize to max value so first frame always passes
-    let mut last_progress = 0u64; // Track last progress update in nanoseconds
-
-    while let Some((stream, packet)) = packet_iter.next() {
-        // Skip packets that aren't from our video stream
-        if stream.index() != video_stream_index {
-            continue;
-        }
-
-        // Get timestamp
-        let pts = packet.pts().unwrap_or(0);
-        let dts = packet.dts().unwrap_or(0);
-        let timestamp_ns = (pts as f64 * time_base.numerator() as f64
-            / time_base.denominator() as f64
-            * 1_000_000_000.0) as u64;
-
-        // Convert AVCC/HVCC to Annex B
-        if let Some(data) = packet.data() {
-            if !data.is_empty() {
-                let pts = packet.pts().ok_or("Missing PTS")?;
-                let dts = packet.dts().ok_or("Missing DTS")?;
-
-                if pts != dts {
-                    return Err(format!(
-                        "This video contains B-frames or reordered frames (PTS={}, DTS={}). \
-                        Please re-encode the video without B-frames using: \
-                        ffmpeg -i {} -c:v {} -bf 0 output.mp4",
-                        pts,
-                        dts,
-                        cli.input.display(),
-                        if codec_format == "h265" {
-                            "libx265"
-                        } else {
-                            "libx264"
-                        }
-                    )
-                    .into());
-                }
-
-                if first_frame || packet.is_key() {
-                    first_frame = false;
-                    let mut frame_data = Vec::new();
-                    if codec_format == "h265" {
-                        // VPS must come before SPS for HEVC
-                        frame_data.extend_from_slice(&vps_nals);
-                    }
-                    frame_data.extend_from_slice(&sps_nals);
-                    frame_data.extend_from_slice(&pps_nals);
-                    let converted = convert_to_annex_b(data, codec_format);
-                    frame_data.extend_from_slice(&converted);
-                    frame_packets.push(frame_data);
-                } else {
-                    let converted = convert_to_annex_b(data, codec_format);
-                    frame_packets.push(converted);
-                }
-            }
-        }
-
-        // Send the packet to the decoder
-        decoder.send_packet(&packet)?;
-
-        // Receive frame if ready
-        match decoder.receive_frame(&mut frame) {
-            Ok(_) => {
-                // Print . for every 1s of video
-                if timestamp_ns >= last_progress + 1_000_000_000 {
-                    print!(".");
-                    std::io::stdout().flush()?;
-                    last_progress = timestamp_ns;
-                }
-
-                // Create a single buffer for the entire frame
-                let mut frame_data = Vec::new();
-                for packet_data in frame_packets.iter() {
-                    frame_data.extend_from_slice(packet_data);
-                }
-
-                // Check for monotonic timestamps before writing
-                if timestamp_ns <= last_timestamp && last_timestamp != u64::MAX {
-                    return Err(format!(
-                        "Non-monotonic or duplicate timestamp detected! Current: {}ns, Last: {}ns, PTS: {}, DTS: {}",
-                        timestamp_ns, last_timestamp, pts, dts
-                    ).into());
-                }
-                last_timestamp = timestamp_ns;
-
-                // Create and write the message
-                let message = CompressedVideo {
-                    frame_id: "video".to_string(),
-                    timestamp: Some(prost_types::Timestamp {
-                        seconds: (timestamp_ns / 1_000_000_000) as i64,
-                        nanos: (timestamp_ns % 1_000_000_000) as i32,
-                    }),
-                    data: frame_data,
-                    format: codec_format.to_string(),
-                };
-
-                // Clear packets buffer for next frame
-                frame_packets.clear();
-
-                // Serialize and write the protobuf message
-                let encoded = message.encode_to_vec();
-                writer.write_to_known_channel(
-                    &MessageHeader {
-                        channel_id,
-                        sequence,
-                        log_time: timestamp_ns,
-                        publish_time: timestamp_ns,
-                    },
-                    &encoded,
-                )?;
-
-                // Increment sequence
-                sequence = sequence.wrapping_add(1);
-                if sequence >= 100 {
-                    break;
-                }
-            }
-            Err(ffmpeg::Error::Other {
-                errno: ffmpeg::error::EAGAIN,
-            }) => {
-                continue;
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-
-    println!();
-
-    // Close the MCAP file
-    writer.finish()?;
-
-    // Send EOF to cleanly close the decoder
-    decoder.send_eof()?;
-
-    Ok(())
+    Ok(writer.add_channel(&channel)?.into())
 }
