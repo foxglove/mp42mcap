@@ -2,6 +2,7 @@ use clap::Parser;
 use ffmpeg_next as ffmpeg;
 use std::{io::Write, path::PathBuf};
 use std::error::Error;
+use std::borrow::Cow;
 
 // Include generated protobuf code
 pub mod foxglove {
@@ -12,7 +13,7 @@ use foxglove::CompressedVideo;
 use prost::Message;
 use prost_types;
 
-use mcap::{Channel, Writer, records::MessageHeader};
+use mcap::{Channel, Schema, Writer, records::MessageHeader};
 use std::{collections::BTreeMap, fs::File, io::BufWriter};
 
 /// Convert MP4 files to MCAP format
@@ -70,11 +71,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         BufWriter::new(File::create(&cli.output)?),
     )?;
 
-    // Create video channel
+    // Create video channel with schema
+    let mcap_schema = Schema {
+        name: String::from("foxglove.CompressedVideo"),
+        encoding: String::from("protobuf"),
+        data: Cow::Owned(include_bytes!(concat!(env!("OUT_DIR"), "/foxglove_descriptor.bin")).to_vec()),
+    };
+
     let channel = Channel {
         topic: String::from("video"),
         message_encoding: String::from("protobuf"),
-        schema: None,
+        schema: Some(mcap_schema.into()),
         metadata: BTreeMap::default(),
     };
     let channel_id = writer.add_channel(&channel)?;
@@ -85,7 +92,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Iterate over packets
     let mut frame = ffmpeg::frame::Video::empty();
     let mut packet_iter = input.packets();
-    while let Some((stream, packet)) = packet_iter.next() {
+    'outer: while let Some((stream, packet)) = packet_iter.next() {
         // Skip packets that aren't from our video stream
         if stream.index() != video_stream_index {
             continue;
@@ -119,7 +126,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             // Write the encoded data to MCAP file
             writer.write_to_known_channel(
                 &MessageHeader {
-                    channel_id,
+                    channel_id: channel_id,
                     sequence,
                     log_time: timestamp_ns,
                     publish_time: timestamp_ns,
@@ -129,6 +136,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             // Increment sequence (wrap at u32::MAX)
             sequence = sequence.wrapping_add(1);
+
+            // Stop after 10 frames while debugging
+            if sequence >= 10 {
+                break 'outer;
+            }
         }
     }
 
