@@ -507,6 +507,7 @@ dependencies = [
  "bytes",
  "clap",
  "ffmpeg-next",
+ "libc",
  "mcap",
  "prost",
  "prost-build",

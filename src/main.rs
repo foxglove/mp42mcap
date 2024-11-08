@@ -16,6 +16,8 @@ use prost_types;
 use mcap::{Channel, Schema, Writer, records::MessageHeader};
 use std::{collections::BTreeMap, fs::File, io::BufWriter};
 
+mod bsf;
+
 /// Convert MP4 files to MCAP format
 #[derive(Parser)]
 #[command(name = env!("CARGO_PKG_NAME"))]
@@ -57,7 +59,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
 
     // Check if codec is supported and get format string
-    let codec_format = match codec.id() {
+    let codec_id = codec.id();
+    let codec_format = match codec_id {
         ffmpeg::codec::Id::H264 => "h264",
         ffmpeg::codec::Id::H265 => "h265",
         ffmpeg::codec::Id::HEVC => "h265",
@@ -107,11 +110,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         let pts = packet.pts().unwrap_or(0);
         let timestamp_ns = (pts as f64 * time_base.numerator() as f64 / time_base.denominator() as f64 * 1_000_000_000.0) as u64;
 
+        // Convert packet to Annex B format
+        if let Some(data) = packet.data() {
+            if !data.is_empty() {
+                let converted = bsf::apply_bsf(codec_id, data)?;
+                frame_packets.push(converted);
+            }
+        }
+
         // Send the packet to the decoder
         decoder.send_packet(&packet)?;
-
-        // Store this packet's data
-        frame_packets.push(packet.data().expect("Missing packet data").to_vec());
 
         // Receive frame if ready
         match decoder.receive_frame(&mut frame) {
@@ -126,7 +134,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         seconds: (timestamp_ns / 1_000_000_000) as i64,
                         nanos: (timestamp_ns % 1_000_000_000) as i32,
                     }),
-                    data: frame_packets.concat(), // Concatenate all packets for this frame
+                    data: frame_packets.concat(),
                     format: codec_format.to_string(),
                 };
 
@@ -145,16 +153,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                     &encoded,
                 )?;
 
-                // Increment sequence (wrap at u32::MAX)
+                // Increment sequence
                 sequence = sequence.wrapping_add(1);
-                if sequence >= 250 {
+                if sequence >= 100 {
                     break;
                 }
             },
-            Err(ffmpeg::Error::Other { errno: ffmpeg::error::EAGAIN }) => {
-                // Frame not ready yet, continue collecting packets
-                continue;
-            },
+            Err(ffmpeg::Error::Other { errno: ffmpeg::error::EAGAIN }) => continue,
             Err(e) => return Err(e.into()),
         }
     }
