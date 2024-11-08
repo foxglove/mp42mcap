@@ -78,6 +78,10 @@ struct Cli {
     /// Output MCAP file
     #[arg(value_name = "OUTPUT")]
     output: PathBuf,
+
+    /// Topic name for the video messages
+    #[arg(long, default_value = "video")]
+    topic: String,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -249,7 +253,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ),
     };
     let channel = Channel {
-        topic: String::from("video"),
+        topic: cli.topic,
         message_encoding: String::from("protobuf"),
         schema: Some(schema.into()),
         metadata: BTreeMap::default(),
