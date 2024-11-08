@@ -41,9 +41,12 @@ fn convert_to_annex_b(data: &[u8], codec_format: &str) -> Vec<u8> {
 
         pos += 4;
 
-        // Skip SPS, PPS, and SEI NALs since we're manually handling them
-        // 7 = SPS, 8 = PPS, 6 = SEI
-        if nal_type != 0x7 && nal_type != 0x8 && nal_type != 0x6 {
+        // Skip SPS, PPS, VPS, and SEI NALs
+        if match codec_format {
+            "h264" => nal_type != 0x7 && nal_type != 0x8 && nal_type != 0x6,
+            "h265" => nal_type != 32 && nal_type != 33 && nal_type != 34 && nal_type != 39,
+            _ => true,
+        } {
             converted.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
             if pos + nal_size <= data.len() {
                 converted.extend_from_slice(&data[pos..pos + nal_size]);
@@ -132,33 +135,106 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Create the decoder after getting all the info we need
     let mut decoder = codec.decoder().video()?;
 
-    // Parse AVCC format extradata to get SPS/PPS
+    // Parse AVCC/HVCC format extradata to get SPS/PPS
+    let mut vps_nals = Vec::new(); // New: VPS NALs for HEVC
     let mut sps_nals = Vec::new();
     let mut pps_nals = Vec::new();
 
-    // AVCC format: [1 byte version][1 byte profile][1 byte compat][1 byte level][6 bits reserved + 2 bits NALsize-1][1 byte num SPS][2 bytes SPS size][SPS data][1 byte num PPS][2 bytes PPS size][PPS data]
-    let mut offset = 5; // Skip AVCC header
+    match codec_format {
+        "h264" => {
+            // Existing AVCC parsing
+            let mut offset = 5; // Skip AVCC header
 
-    // Get SPS
-    let num_sps = extradata[offset] & 0x1F;
-    offset += 1;
-    for _ in 0..num_sps {
-        let sps_size = ((extradata[offset] as usize) << 8) | (extradata[offset + 1] as usize);
-        offset += 2;
-        sps_nals.extend_from_slice(&[0, 0, 0, 1]); // Add NAL start code
-        sps_nals.extend_from_slice(&extradata[offset..offset + sps_size]);
-        offset += sps_size;
-    }
+            // Get SPS
+            let num_sps = extradata[offset] & 0x1F;
+            offset += 1;
+            for _ in 0..num_sps {
+                let sps_size =
+                    ((extradata[offset] as usize) << 8) | (extradata[offset + 1] as usize);
+                offset += 2;
+                sps_nals.extend_from_slice(&[0, 0, 0, 1]); // Add NAL start code
+                sps_nals.extend_from_slice(&extradata[offset..offset + sps_size]);
+                offset += sps_size;
+            }
 
-    // Get PPS
-    let num_pps = extradata[offset];
-    offset += 1;
-    for _ in 0..num_pps {
-        let pps_size = ((extradata[offset] as usize) << 8) | (extradata[offset + 1] as usize);
-        offset += 2;
-        pps_nals.extend_from_slice(&[0, 0, 0, 1]); // Add NAL start code
-        pps_nals.extend_from_slice(&extradata[offset..offset + pps_size]);
-        offset += pps_size;
+            // Get PPS
+            let num_pps = extradata[offset];
+            offset += 1;
+            for _ in 0..num_pps {
+                let pps_size =
+                    ((extradata[offset] as usize) << 8) | (extradata[offset + 1] as usize);
+                offset += 2;
+                pps_nals.extend_from_slice(&[0, 0, 0, 1]); // Add NAL start code
+                pps_nals.extend_from_slice(&extradata[offset..offset + pps_size]);
+                offset += pps_size;
+            }
+        }
+        "h265" => {
+            // HVCC parsing
+            if extradata.len() < 23 {
+                return Err("HVCC header too short".into());
+            }
+
+            // Skip HVCC header (22 bytes) to reach NAL arrays
+            let mut offset = 22;
+
+            // Get number of array entries
+            let num_arrays = extradata[offset];
+            offset += 1;
+
+            // Process each NAL array
+            for _ in 0..num_arrays {
+                if offset + 3 > extradata.len() {
+                    break;
+                }
+
+                // First byte: NAL type (lower 6 bits)
+                let nal_type = extradata[offset] & 0x3F;
+                let num_nals =
+                    ((extradata[offset + 1] as usize) << 8) | (extradata[offset + 2] as usize);
+                offset += 3;
+
+                // Process NALs in this array
+                for _ in 0..num_nals {
+                    if offset + 2 > extradata.len() {
+                        break;
+                    }
+
+                    let nal_size =
+                        ((extradata[offset] as usize) << 8) | (extradata[offset + 1] as usize);
+                    offset += 2;
+
+                    if offset + nal_size > extradata.len() {
+                        break;
+                    }
+
+                    // Add NAL start code and data to appropriate vector
+                    let nal_data = &[0, 0, 0, 1];
+                    match nal_type {
+                        32 => {
+                            vps_nals.extend_from_slice(nal_data);
+                            vps_nals.extend_from_slice(&extradata[offset..offset + nal_size]);
+                        }
+                        33 => {
+                            sps_nals.extend_from_slice(nal_data);
+                            sps_nals.extend_from_slice(&extradata[offset..offset + nal_size]);
+                        }
+                        34 => {
+                            pps_nals.extend_from_slice(nal_data);
+                            pps_nals.extend_from_slice(&extradata[offset..offset + nal_size]);
+                        }
+                        _ => {}
+                    }
+                    offset += nal_size;
+                }
+            }
+
+            // Verify we got the necessary NALs
+            if sps_nals.is_empty() || pps_nals.is_empty() {
+                return Err("Missing required HEVC parameter sets".into());
+            }
+        }
+        _ => return Err("Unsupported codec format".into()),
     }
 
     // Open MCAP file for writing
@@ -219,30 +295,28 @@ fn main() -> Result<(), Box<dyn Error>> {
                     return Err(format!(
                         "This video contains B-frames or reordered frames (PTS={}, DTS={}). \
                         Please re-encode the video without B-frames using: \
-                        ffmpeg -i {} -c:v libx264 -bf 0 output.mp4",
+                        ffmpeg -i {} -c:v {} -bf 0 output.mp4",
                         pts,
                         dts,
-                        cli.input.display()
+                        cli.input.display(),
+                        if codec_format == "h265" {
+                            "libx265"
+                        } else {
+                            "libx264"
+                        }
                     )
                     .into());
                 }
 
-                if first_frame {
+                if first_frame || packet.is_key() {
                     first_frame = false;
                     let mut frame_data = Vec::new();
-                    // Add SPS and PPS first
+                    if codec_format == "h265" {
+                        // VPS must come before SPS for HEVC
+                        frame_data.extend_from_slice(&vps_nals);
+                    }
                     frame_data.extend_from_slice(&sps_nals);
                     frame_data.extend_from_slice(&pps_nals);
-                    // Then convert and add the packet data
-                    let converted = convert_to_annex_b(data, codec_format);
-                    frame_data.extend_from_slice(&converted);
-                    frame_packets.push(frame_data);
-                } else if packet.is_key() {
-                    let mut frame_data = Vec::new();
-                    // Add SPS and PPS first
-                    frame_data.extend_from_slice(&sps_nals);
-                    frame_data.extend_from_slice(&pps_nals);
-                    // Then convert and add the packet data
                     let converted = convert_to_annex_b(data, codec_format);
                     frame_data.extend_from_slice(&converted);
                     frame_packets.push(frame_data);
