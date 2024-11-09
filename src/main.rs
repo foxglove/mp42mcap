@@ -12,7 +12,6 @@ use clap::Parser;
 use ffmpeg_next as ffmpeg;
 use mcap::{records::MessageHeader, Channel, Schema, Writer};
 use prost::Message;
-use prost_types;
 
 pub mod foxglove {
     include!(concat!(env!("OUT_DIR"), "/foxglove.rs"));
@@ -68,8 +67,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut frame = ffmpeg::frame::Video::empty();
     let first_frame = true;
 
-    let mut packet_iter = input.packets();
-    while let Some((stream, packet)) = packet_iter.next() {
+    let packet_iter = input.packets();
+    for (stream, packet) in packet_iter {
         if stream.index() != video_stream_index {
             continue;
         }

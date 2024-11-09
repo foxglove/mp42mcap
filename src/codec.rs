@@ -233,7 +233,7 @@ pub fn convert_to_annex_b(data: &[u8], codec: CodecType) -> Vec<u8> {
         let nal_size =
             u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
 
-        let nal_type = if pos + 4 + 1 <= data.len() {
+        let nal_type = if pos + 4 < data.len() {
             match codec {
                 CodecType::H264 => data[pos + 4] & 0x1F,
                 CodecType::H265 => (data[pos + 4] >> 1) & 0x3F,
