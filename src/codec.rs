@@ -411,3 +411,162 @@ impl VideoConverter {
         self.codec_type.format_str()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_codec_type_from_ffmpeg_id() {
+        assert_eq!(
+            CodecType::from_ffmpeg_id(ffmpeg::codec::Id::H264).unwrap(),
+            CodecType::H264
+        );
+        assert_eq!(
+            CodecType::from_ffmpeg_id(ffmpeg::codec::Id::H265).unwrap(),
+            CodecType::H265
+        );
+        assert_eq!(
+            CodecType::from_ffmpeg_id(ffmpeg::codec::Id::HEVC).unwrap(),
+            CodecType::H265
+        );
+        assert!(CodecType::from_ffmpeg_id(ffmpeg::codec::Id::VP9).is_err());
+    }
+
+    #[test]
+    fn test_codec_type_format_strings() {
+        assert_eq!(CodecType::H264.format_str(), "h264");
+        assert_eq!(CodecType::H265.format_str(), "h265");
+        assert_eq!(CodecType::H264.encoder_lib(), "libx264");
+        assert_eq!(CodecType::H265.encoder_lib(), "libx265");
+    }
+
+    #[test]
+    fn test_should_skip_nal() {
+        // H.264 NAL skipping
+        assert!(CodecType::H264.should_skip_nal(CodecType::H264_NAL_SPS));
+        assert!(CodecType::H264.should_skip_nal(CodecType::H264_NAL_PPS));
+        assert!(CodecType::H264.should_skip_nal(CodecType::H264_NAL_SEI));
+        assert!(!CodecType::H264.should_skip_nal(1)); // Slice NAL
+
+        // H.265 NAL skipping
+        assert!(CodecType::H265.should_skip_nal(CodecType::H265_NAL_VPS));
+        assert!(CodecType::H265.should_skip_nal(CodecType::H265_NAL_SPS));
+        assert!(CodecType::H265.should_skip_nal(CodecType::H265_NAL_PPS));
+        assert!(CodecType::H265.should_skip_nal(CodecType::H265_NAL_SEI));
+        assert!(!CodecType::H265.should_skip_nal(1)); // Slice NAL
+    }
+
+    #[test]
+    fn test_parameter_sets_validation() {
+        let valid_h264 = ParameterSets {
+            vps: vec![],
+            sps: vec![1],
+            pps: vec![2],
+        };
+        assert!(valid_h264.validate(CodecType::H264).is_ok());
+
+        let valid_h265 = ParameterSets {
+            vps: vec![1],
+            sps: vec![2],
+            pps: vec![3],
+        };
+        assert!(valid_h265.validate(CodecType::H265).is_ok());
+
+        let invalid_h264 = ParameterSets {
+            vps: vec![],
+            sps: vec![],
+            pps: vec![],
+        };
+        assert!(invalid_h264.validate(CodecType::H264).is_err());
+
+        let invalid_h265 = ParameterSets {
+            vps: vec![],
+            sps: vec![1],
+            pps: vec![2],
+        };
+        assert!(invalid_h265.validate(CodecType::H265).is_err());
+    }
+
+    #[test]
+    fn test_convert_to_annex_b() {
+        // Test H264 conversion
+        let input = vec![
+            0x00, 0x00, 0x00, 0x05, // NAL size
+            0x01, 0x02, 0x03, 0x04, 0x05, // NAL data
+            0x00, 0x00, 0x00, 0x03, // Another NAL size
+            0x07, 0x08, 0x09, // SPS NAL (should be skipped)
+        ];
+
+        let output = convert_to_annex_b(&input, CodecType::H264);
+        assert_eq!(&output[..4], &[0x00, 0x00, 0x00, 0x01]); // Start code
+        assert_eq!(&output[4..9], &[0x01, 0x02, 0x03, 0x04, 0x05]);
+        assert_eq!(output.len(), 9); // Second NAL should be skipped
+    }
+
+    #[test]
+    fn test_parameter_sets_parse() {
+        // Test AVCC parsing (H.264)
+        let avcc = vec![
+            1, 0, 0, 0, 0, // AVCC header
+            1, // num_sps
+            0, 0x05, // sps_size
+            0x67, 0x42, 0x00, 0x0A, 0x00, // SPS data
+            1,    // num_pps
+            0, 0x03, // pps_size
+            0x68, 0xCE, 0x38, // PPS data
+        ];
+        let params = ParameterSets::parse(&avcc, CodecType::H264).unwrap();
+        assert!(params.vps.is_empty());
+        assert!(!params.sps.is_empty());
+        assert!(!params.pps.is_empty());
+    }
+
+    #[test]
+    fn test_timestamp_conversion() {
+        // Test the timestamp conversion logic directly
+        let time_base_num = 1;
+        let time_base_den = 90000;
+        let pts = 90000;
+        let timestamp =
+            (pts as f64 * time_base_num as f64 / time_base_den as f64 * 1_000_000_000.0) as u64;
+        assert_eq!(timestamp, 1_000_000_000); // 1 second
+    }
+
+    #[test]
+    fn test_timestamp_monotonicity() {
+        let mut last_timestamp = u64::MAX;
+
+        // Helper function to mimic check_timestamp logic
+        let check_timestamp = |ts: u64, last: &mut u64| -> Result<(), Box<dyn Error>> {
+            if ts <= *last && *last != u64::MAX {
+                return Err("Non-monotonic timestamp".into());
+            }
+            *last = ts;
+            Ok(())
+        };
+
+        assert!(check_timestamp(1000, &mut last_timestamp).is_ok());
+        assert!(check_timestamp(2000, &mut last_timestamp).is_ok());
+        assert!(check_timestamp(1500, &mut last_timestamp).is_err()); // Should fail - going backwards
+    }
+
+    #[test]
+    fn test_progress_updates() {
+        let mut last_progress = 0u64;
+
+        // Helper function to mimic update_progress logic
+        let update_progress = |ts: u64, last: &mut u64| -> bool {
+            if ts >= *last + 1_000_000_000 {
+                *last = ts;
+                true
+            } else {
+                false
+            }
+        };
+
+        assert!(update_progress(1_000_000_000, &mut last_progress)); // Should update at 1s
+        assert!(!update_progress(1_500_000_000, &mut last_progress)); // Shouldn't update at 1.5s
+        assert!(update_progress(2_000_000_000, &mut last_progress)); // Should update at 2s
+    }
+}
